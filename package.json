@@ -13,6 +13,7 @@
   "dependencies": {
     "axios": "^1.13.2",
     "cheerio": "^1.1.2",
+    "chromadb": "^3.2.0",
     "dotenv": "^17.2.3",
     "openai": "^6.15.0"
   }
