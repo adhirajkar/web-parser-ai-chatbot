@@ -17,19 +17,37 @@ async function scrapeWebpage(url = "") {
   const { data } = await axios.get(url);
 
   const $ = cheerio.load(data);
-  const pageHead = $("head").html();
-  const pageBody = $("body").html();
+
+  const pageTitle = $("title").text();
+  const pageDescription = $('meta[name="description"]').attr("content") || "";
+  const pageHead = `${pageTitle} ${pageDescription}`.trim();
+
+  $("script, style, noscript").remove();
+  const pageBody = $("body").text().replace(/\s+/g, " ").trim();
 
   let internalLinks = new Set();
   let externalLinks = new Set();
 
+  const urlObj = new URL(url);
+  const baseUrl = `${urlObj.protocol}//${urlObj.host}`;
+
   $("a").each((_, ele) => {
     const link = $(ele).attr("href");
-    if (link == "/") return;
-    if (link.startsWith("https") || link.startsWith("https")) {
-      externalLinks.add(link);
-    } else {
-      internalLinks.add(link);
+    if (!link || link === "/" || link === "#") return;
+
+    if (link.startsWith("http://") || link.startsWith("https://")) {
+      if (link.startsWith(baseUrl)) {
+        internalLinks.add(link);
+      } else {
+        externalLinks.add(link);
+      }
+    } else if (link.startsWith("/")) {
+      internalLinks.add(`${baseUrl}${link}`);
+    } else if (!link.startsWith("#")) {
+      const fullUrl = new URL(link, url).href;
+      if (fullUrl.startsWith(baseUrl)) {
+        internalLinks.add(fullUrl);
+      }
     }
   });
 
@@ -42,9 +60,12 @@ async function scrapeWebpage(url = "") {
 }
 
 async function generateVectorEmbeddings({ text }) {
+  const MAX_CHARS = 30000;
+  const truncatedText = text.length > MAX_CHARS ? text.substring(0, MAX_CHARS) : text;
+
   const embedding = await openai.embeddings.create({
     model: "text-embedding-3-small",
-    input: text,
+    input: truncatedText,
     encoding_format: "float",
   });
   return embedding.data[0].embedding;
@@ -54,39 +75,79 @@ const WEB_COLLECTION = `WEB_SCRAPED_DATA`;
 async function insertIntoDb({ embedding, url, body = "", head }) {
   const collection = await chromaClient.getOrCreateCollection({
     name: WEB_COLLECTION,
+    embeddingFunction: null,
   });
+
+  const id = `${url}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
   await collection.add({
-    ids: [url],
+    ids: [id],
     embeddings: [embedding],
     metadatas: [{ url, body, head }],
   });
 }
-async function ingest(url = "") {
-  console.log("Ingesting ", url);
-  const { head, body, internalLinks } = await scrapeWebpage(url);
-  const bodyChunks = chunkText(body, 1000);
 
-  //   const headEmbedding = await generateVectorEmbeddings({ text: head });
-  //   await insertIntoDb({
-  //     embedding: headEmbedding,
-  //     url,
-  //   });
-  for (const chunk of bodyChunks) {
-    const bodyEmbedding = await generateVectorEmbeddings({ text: chunk });
-    await insertIntoDb({
-      embedding: bodyEmbedding,
-      url,
-      head,
-      body: chunk,
-    });
+const visitedUrls = new Set();
+const MAX_DEPTH = 3;
+const MAX_PAGES = 50;
+
+async function ingest(url = "", depth = 0) {
+  if (depth > MAX_DEPTH) {
+    console.log(`Skipping ${url} - max depth reached`);
+    return;
   }
 
-  for (const link of internalLinks) {
-    const _url = `${url}${link}`;
-    await ingest(_url);
+  if (visitedUrls.size >= MAX_PAGES) {
+    console.log(`Skipping ${url} - max pages limit reached`);
+    return;
   }
 
-  console.log(`Ingesting success `, url);
+  const nonHtmlExtensions = [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".mp4", ".zip", ".exe"];
+  if (nonHtmlExtensions.some((ext) => url.toLowerCase().endsWith(ext))) {
+    console.log(`Skipping ${url} - non-HTML file`);
+    return;
+  }
+
+  const normalizedUrl = url.split("#")[0].replace(/\/$/, "");
+
+  if (visitedUrls.has(normalizedUrl)) {
+    console.log(`Skipping ${url} - already visited`);
+    return;
+  }
+
+  visitedUrls.add(normalizedUrl);
+  console.log(`Ingesting [${depth}/${MAX_DEPTH}] (${visitedUrls.size}/${MAX_PAGES}): ${url}`);
+
+  try {
+    const { head, body, internalLinks } = await scrapeWebpage(url);
+
+    if (!body || body.length === 0) {
+      console.log(`Skipping ${url} - empty content`);
+      return;
+    }
+
+    const bodyChunks = chunkText(body, 1000);
+
+    for (const chunk of bodyChunks) {
+      if (!chunk || chunk.trim().length === 0) continue;
+
+      const bodyEmbedding = await generateVectorEmbeddings({ text: chunk });
+      await insertIntoDb({
+        embedding: bodyEmbedding,
+        url,
+        head,
+        body: chunk,
+      });
+    }
+
+    console.log(`Ingested successfully: ${url} (${bodyChunks.length} chunks)`);
+
+    for (const link of internalLinks) {
+      await ingest(link, depth + 1);
+    }
+  } catch (error) {
+    console.error(`Error ingesting ${url}:`, error.message);
+  }
 }
 
-ingest("https://adhiraj.lol");
+ingest("https://github.com/adhirajkar/web-parser-ai-chatbot");
