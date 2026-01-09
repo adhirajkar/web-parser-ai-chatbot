@@ -1,8 +1,6 @@
-import axios from "axios";
-import * as cheerio from "cheerio";
 import OpenAI from "openai";
 import "dotenv/config";
-import { chunkText } from "./helper.js";
+import { chunkText, scrapeWebpage } from "./utils/helper.js";
 import { ChromaClient } from "chromadb";
 
 const openai = new OpenAI();
@@ -13,55 +11,10 @@ const chromaClient = new ChromaClient({
 });
 await chromaClient.heartbeat();
 
-async function scrapeWebpage(url = "") {
-  const { data } = await axios.get(url);
-
-  const $ = cheerio.load(data);
-
-  const pageTitle = $("title").text();
-  const pageDescription = $('meta[name="description"]').attr("content") || "";
-  const pageHead = `${pageTitle} ${pageDescription}`.trim();
-
-  $("script, style, noscript").remove();
-  const pageBody = $("body").text().replace(/\s+/g, " ").trim();
-
-  let internalLinks = new Set();
-  let externalLinks = new Set();
-
-  const urlObj = new URL(url);
-  const baseUrl = `${urlObj.protocol}//${urlObj.host}`;
-
-  $("a").each((_, ele) => {
-    const link = $(ele).attr("href");
-    if (!link || link === "/" || link === "#") return;
-
-    if (link.startsWith("http://") || link.startsWith("https://")) {
-      if (link.startsWith(baseUrl)) {
-        internalLinks.add(link);
-      } else {
-        externalLinks.add(link);
-      }
-    } else if (link.startsWith("/")) {
-      internalLinks.add(`${baseUrl}${link}`);
-    } else if (!link.startsWith("#")) {
-      const fullUrl = new URL(link, url).href;
-      if (fullUrl.startsWith(baseUrl)) {
-        internalLinks.add(fullUrl);
-      }
-    }
-  });
-
-  return {
-    head: pageHead,
-    body: pageBody,
-    internalLinks: Array.from(internalLinks),
-    externalLinks: Array.from(externalLinks),
-  };
-}
-
 async function generateVectorEmbeddings({ text }) {
   const MAX_CHARS = 30000;
-  const truncatedText = text.length > MAX_CHARS ? text.substring(0, MAX_CHARS) : text;
+  const truncatedText =
+    text.length > MAX_CHARS ? text.substring(0, MAX_CHARS) : text;
 
   const embedding = await openai.embeddings.create({
     model: "text-embedding-3-small",
@@ -102,7 +55,17 @@ async function ingest(url = "", depth = 0) {
     return;
   }
 
-  const nonHtmlExtensions = [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".mp4", ".zip", ".exe"];
+  const nonHtmlExtensions = [
+    ".pdf",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".svg",
+    ".mp4",
+    ".zip",
+    ".exe",
+  ];
   if (nonHtmlExtensions.some((ext) => url.toLowerCase().endsWith(ext))) {
     console.log(`Skipping ${url} - non-HTML file`);
     return;
@@ -116,7 +79,9 @@ async function ingest(url = "", depth = 0) {
   }
 
   visitedUrls.add(normalizedUrl);
-  console.log(`Ingesting [${depth}/${MAX_DEPTH}] (${visitedUrls.size}/${MAX_PAGES}): ${url}`);
+  console.log(
+    `Ingesting [${depth}/${MAX_DEPTH}] (${visitedUrls.size}/${MAX_PAGES}): ${url}`
+  );
 
   try {
     const { head, body, internalLinks } = await scrapeWebpage(url);
@@ -150,4 +115,46 @@ async function ingest(url = "", depth = 0) {
   }
 }
 
-ingest("https://github.com/adhirajkar/web-parser-ai-chatbot");
+async function chat(query = "") {
+  const embeddings = await generateVectorEmbeddings({ text: query });
+  console;
+  const collection = await chromaClient.getOrCreateCollection({
+    name: WEB_COLLECTION,
+  });
+  const collectionResult = await collection.query({
+    nResults: 1,
+    queryEmbeddings: [embeddings],
+  });
+
+  const body = collectionResult.metadatas[0]
+    .map((e) => e.body)
+    .filter((e) => e.trim() !== "" && !!e);
+
+  const url = collectionResult.metadatas[0]
+    .map((e) => e.url)
+    .filter((e) => e.trim() !== "" && !!e);
+
+  const response = await openai.chat.completions.create({
+    model: "chatgpt-4o-latest",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are an AI support agent expert in providing support for the webpage content given to you. Reply accordingly to the user.",
+      },
+      {
+        role: "user",
+        content: `
+                Query: ${query}\n\n
+                URLs: ${url.join(",")}
+                Retrived content of webpage: ${body.join(", ")}
+            `,
+      },
+    ],
+  });
+
+  console.log("🤖: ", response.choices[0].message.content);
+}
+
+// ingest("https://adhiraj.lol");
+chat("Who is Adhiraj?");
