@@ -5,7 +5,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "reset-db": "node scripts/reset-collection.js",
+    "read-db": "node scripts/view-db.js"
   },
   "keywords": [],
   "author": "",
